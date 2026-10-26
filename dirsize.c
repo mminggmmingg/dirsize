@@ -11,6 +11,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <glob.h>
+#include <linux/nvme_ioctl.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -27,7 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "2.1.0"
+#define VERSION "2.2.0"
 #define DENTS_BUF (64 * 1024)
 
 /* ---------- options ---------- */
@@ -223,8 +225,8 @@ enum { CAT_VIDEO, CAT_IMAGE, CAT_AUDIO, CAT_MODEL, CAT_DATA, CAT_ARCHIVE, CAT_DO
        CAT_CODE, CAT_BINARY, CAT_LOG, CAT_OTHER, NCAT };
 
 static const char *cat_names[NCAT] = {
-    "동영상", "이미지", "오디오", "AI 모델·가중치", "데이터셋·DB", "압축·디스크이미지·패키지",
-    "문서", "소스코드", "라이브러리·실행파일", "로그", "기타·확장자 없음"};
+    "Video", "Images", "Audio", "AI models / weights", "Datasets / DB", "Archives / disk images",
+    "Documents", "Source code", "Libraries / binaries", "Logs", "Other / no extension"};
 static const char *cat_hint[NCAT] = {
     ".mp4 .mkv .mov", ".jpg .png .heic", ".mp3 .flac .wav", ".safetensors .gguf .pt .bin",
     ".npy .parquet .csv .db", ".zip .tar.gz .iso .ipsw", ".pdf .docx .hwp .md",
@@ -524,8 +526,8 @@ static void print_row(uint64_t size, uint64_t whole, const char *prefix,
     safe_print(name);
     size_t nl = strlen(name);
     printf("%s%s", dir && nl && name[nl - 1] != '/' ? "/" : "", C("0"));
-    if (mount) printf("  %s[다른 파일시스템 · -c 로 포함]%s", C("2"), C("0"));
-    if (bad) printf("  %s! 읽기오류%s", C("33"), C("0"));
+    if (mount) printf("  %s[other filesystem · include with -c]%s", C("2"), C("0"));
+    if (bad) printf("  %s! read errors%s", C("33"), C("0"));
     if (note) printf("  %s%s%s", C("2"), note, C("0"));
     putchar('\n');
 }
@@ -563,7 +565,7 @@ static void print_tree(node *n, uint64_t whole, char *prefix) {
             int last = shown == visible && !rest_line;
             const char *branch = last ? "└── " : "├── ";
             if (take_files) {
-                print_row(sz, whole, prefix, branch, "(이 폴더의 파일들)", 0, 0, 0, NULL);
+                print_row(sz, whole, prefix, branch, "(files in this dir)", 0, 0, 0, NULL);
             } else {
                 print_row(sz, whole, prefix, branch, k->name, 1, k->errors > 0, k->is_mount, NULL);
                 if (k->nkids || k->files_direct) {
@@ -581,7 +583,7 @@ static void print_tree(node *n, uint64_t whole, char *prefix) {
     }
     if (hidden) {
         char note[64];
-        snprintf(note, sizeof note, "외 %d개", hidden);
+        snprintf(note, sizeof note, "%d more", hidden);
         print_row(hidden_sz, whole, prefix, "└── ", "…", 0, 0, 0, note);
     }
 }
@@ -758,10 +760,10 @@ static void print_part(const char *name, const char *sysdir, int last) {
         human(used, us, sizeof us); human(sz, ss, sizeof ss); human(avail, as, sizeof as);
         printf("%-6s %s%-14s%s %6s / %-6s ", m->fs, C("1;34"), m->mnt, C("0"), us, ss);
         bar(frac, 20, usage_color(frac));
-        printf(" %3.0f%%  %s여유 %s%s\n", ceil(frac * 100), C("2"), as, C("0"));
+        printf(" %3.0f%%  %sfree %s%s\n", ceil(frac * 100), C("2"), as, C("0"));
     } else {
         human(sectors * 512, hs, sizeof hs);
-        printf("%s%-6s %-14s %6s%s\n", C("2"), "-", m ? m->mnt : "(마운트 안 됨)", hs, C("0"));
+        printf("%s%-6s %-14s %6s%s\n", C("2"), "-", m ? m->mnt : "(not mounted)", hs, C("0"));
     }
 }
 
@@ -772,11 +774,140 @@ static int is_partition(const char *disk, const char *ent) {
     return stat(p, &st) == 0;
 }
 
+/* ---------- NVMe health: temperature (hwmon, no root) + SMART log (needs root) ---------- */
+
+static void human_si(double v, char *out, size_t n) {   // decimal units, as drive vendors rate TBW
+    const char *u[] = {"B", "KB", "MB", "GB", "TB", "PB", "EB"};
+    int i = 0;
+    while (v >= 1000 && i < 6) { v /= 1000; i++; }
+    snprintf(out, n, i == 0 ? "%.0f %s" : "%.1f %s", v, u[i]);
+}
+
+static double le128(const uint8_t *p) {   // 128-bit little-endian counter -> double
+    double v = 0;
+    for (int i = 15; i >= 0; i--) v = v * 256 + p[i];
+    return v;
+}
+
+static void print_nvme_health(const char *disk) {
+    const char *pad = "             ";
+    char pat[512], v[64];
+
+    // temperatures: temp1 = composite, others = individual sensors (millidegrees C)
+    snprintf(pat, sizeof pat, "/sys/block/%s/device/hwmon*/temp*_input", disk);
+    glob_t g;
+    int have_temp = 0;
+    if (glob(pat, 0, NULL, &g) == 0) {
+        double comp = -1000, warn = 0;
+        char sensors[256] = "";
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            if (read_line(g.gl_pathv[i], v, sizeof v) != 0) continue;
+            double c = atof(v) / 1000;
+            if (strstr(g.gl_pathv[i], "/temp1_input")) {
+                comp = c;
+                char mp[600];
+                snprintf(mp, sizeof mp, "%.*s_max", (int)(strlen(g.gl_pathv[i]) - 6), g.gl_pathv[i]);
+                if (read_line(mp, v, sizeof v) == 0) warn = atof(v) / 1000;
+            } else {
+                size_t l = strlen(sensors);
+                snprintf(sensors + l, sizeof sensors - l, "%s%.0f", l ? "/" : "", c);
+            }
+        }
+        globfree(&g);
+        if (comp > -1000) {
+            have_temp = 1;
+            double lim = warn > 0 ? warn : 85;
+            const char *col = comp >= lim ? "\033[1;31m" : comp >= lim - 15 ? "\033[33m" : "\033[32m";
+            printf("%s%sTemp%s     %s%.0f°C%s  ", pad, C("1"), C("0"), use_color ? col : "", comp, C("0"));
+            bar(comp / lim, 10, col);
+            if (warn > 0) printf("  %swarn %.0f°C%s", C("2"), warn, C("0"));
+            if (sensors[0]) printf("  %s· sensors %s°C%s", C("2"), sensors, C("0"));
+            putchar('\n');
+        }
+    }
+    (void)have_temp;
+
+    // controller char device: /sys/block/nvme0n1/device -> .../nvme0
+    snprintf(pat, sizeof pat, "/sys/block/%s/device", disk);
+    char *ctrl = realpath(pat, NULL);
+    if (!ctrl) return;
+    char dev[300];
+    snprintf(dev, sizeof dev, "/dev/%s", strrchr(ctrl, '/') + 1);
+    free(ctrl);
+
+    uint8_t log[512];
+    memset(log, 0, sizeof log);
+    struct nvme_admin_cmd cmd;
+    memset(&cmd, 0, sizeof cmd);
+    cmd.opcode = 0x02;                       // Get Log Page
+    cmd.nsid = 0xffffffff;
+    cmd.addr = (uint64_t)(uintptr_t)log;
+    cmd.data_len = sizeof log;
+    cmd.cdw10 = ((sizeof log / 4 - 1) << 16) | 0x02;   // NUMDL | LID 02h = SMART / Health
+    int fd = open(dev, O_RDONLY | O_CLOEXEC);
+    int ok = fd >= 0 && ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd) == 0;
+    int err = errno;
+    if (fd >= 0) close(fd);
+
+    if (!ok) {
+        // without root we can still show what was written since boot
+        snprintf(pat, sizeof pat, "/sys/block/%s/stat", disk);
+        char st[512];
+        unsigned long long f[8] = {0};
+        if (read_line(pat, st, sizeof st) == 0 &&
+            sscanf(st, "%llu %llu %llu %llu %llu %llu %llu", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6]) == 7) {
+            char w[32], r[32];
+            human_si(f[6] * 512.0, w, sizeof w);
+            human_si(f[2] * 512.0, r, sizeof r);
+            printf("%s%sWear%s     %s? (%s)%s  · since boot: %s written, %s read\n", pad, C("1"), C("0"),
+                   C("2"), err == EACCES || err == EPERM ? "run with sudo for wear % / TBW" : strerror(err),
+                   C("0"), w, r);
+        }
+        return;
+    }
+
+    int warnbits = log[0];
+    int spare = log[3], spare_thr = log[4], used = log[5];
+    double units_read = le128(log + 32), units_written = le128(log + 48);
+    double hours = le128(log + 128), cycles = le128(log + 112);
+    double unsafe = le128(log + 144), media_err = le128(log + 160);
+    double written = units_written * 512000.0, readb = units_read * 512000.0;
+
+    char w[32], r[32];
+    human_si(written, w, sizeof w);
+    human_si(readb, r, sizeof r);
+    const char *col = used >= 90 ? "\033[1;31m" : used >= 70 ? "\033[33m" : "\033[32m";
+    printf("%s%sWear%s     %s%d%% used%s  ", pad, C("1"), C("0"), use_color ? col : "", used, C("0"));
+    bar(used / 100.0, 10, col);
+    printf("  %s· spare %d%% (min %d%%)%s\n", C("2"), spare, spare_thr, C("0"));
+
+    printf("%s%sTBW%s      %s%s written%s  %s· %s read", pad, C("1"), C("0"), C("1"), w, C("0"), C("2"), r);
+    if (used > 0) {
+        char e[32];
+        human_si(written / (used / 100.0), e, sizeof e);
+        printf(" · ~%s endurance at this wear rate", e);
+    }
+    printf("%s\n", C("0"));
+
+    printf("%s%sHistory%s  %s%.0f h powered on (%.1f years) · %.0f power cycles · %.0f unsafe shutdowns%s\n",
+           pad, C("1"), C("0"), C("2"), hours, hours / 8766, cycles, unsafe, C("0"));
+    if (warnbits || media_err)
+        printf("%s%sStatus%s   %scritical warning 0x%02x · %.0f media errors%s\n", pad, C("1"), C("0"),
+               use_color ? "\033[1;31m" : "", warnbits, media_err, C("0"));
+    else
+        printf("%s%sStatus%s   %sOK · no critical warnings · 0 media errors%s\n", pad, C("1"), C("0"),
+               use_color ? "\033[32m" : "", C("0"));
+}
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
 static void print_disks(void) {
     load_mounts();
     DIR *d = opendir("/sys/block");
     if (!d) return;
-    section("저장장치");
+    section("Storage devices");
     struct dirent *e;
     char **names = NULL;
     int n = 0;
@@ -790,7 +921,7 @@ static void print_disks(void) {
         names[n++] = strdup(nm);
     }
     closedir(d);
-    qsort(names, n, sizeof *names, (int (*)(const void *, const void *))strcmp);
+    qsort(names, n, sizeof *names, cmp_str);
     for (int i = 0; i < n; i++) {
         char p[1024], model[256] = "", v[64];
         snprintf(p, sizeof p, "/sys/block/%s/size", names[i]);
@@ -806,7 +937,8 @@ static void print_disks(void) {
         char hs[16];
         human(bytes, hs, sizeof hs);
         printf("  %s%s%s  %s%s%s · %s%s · %s\n", C("1"), names[i], C("0"), C("36"),
-               model[0] ? model : "unknown", C("0"), kind, rem ? " (이동식)" : "", hs);
+               model[0] ? model : "unknown", C("0"), kind, rem ? " (removable)" : "", hs);
+        if (!strncmp(names[i], "nvme", 4)) print_nvme_health(names[i]);
 
         // partitions, or the whole disk if it is used without a partition table
         char sysdir[1024];
@@ -820,7 +952,7 @@ static void print_disks(void) {
             parts[np++] = strdup(e->d_name);
         }
         if (pd) closedir(pd);
-        qsort(parts, np, sizeof *parts, (int (*)(const void *, const void *))strcmp);
+        qsort(parts, np, sizeof *parts, cmp_str);
         if (!np) print_part(names[i], sysdir, 1);
         for (int j = 0; j < np; j++) {
             char pdir[2048];
@@ -852,7 +984,7 @@ static void print_breakdown(const char *root, const char *src, const char *mnt,
     double frac = (fused + favail) ? (double)fused / (double)(fused + favail) : 0;
 
     char title[4096];
-    snprintf(title, sizeof title, "%s 사용량  (%s → %s)", root, src, mnt);
+    snprintf(title, sizeof title, "%s usage  (%s → %s)", root, src, mnt);
     section(title);
     printf("  Size %s%s%s   Used %s%s%s   Avail %s%s%s   Use%% %s%.0f%%%s\n  ",
            C("1"), a, C("0"), C("1"), b, C("0"), C("1"), d, C("0"),
@@ -865,29 +997,29 @@ static void print_breakdown(const char *root, const char *src, const char *mnt,
         uint64_t outside = fused > scanned ? fused - scanned : 0;
         char o[16];
         human(outside, o, sizeof o);
-        printf("  "); label("스캔된 파일·폴더", 20);
+        printf("  "); label("Scanned files/dirs", 20);
         printf(" %7s  %5.1f%%  ", s, 100.0 * scanned / fused);
         bar((double)scanned / fused, 20, "\033[36m");
-        printf("\n  "); label("스캔 밖 (못 읽음)", 20);
+        printf("\n  "); label("Not scanned", 20);
         printf(" %7s  %5.1f%%  ", o, 100.0 * outside / fused);
         bar((double)outside / fused, 20, "\033[33m");
-        printf("  %s권한 없는 폴더 · FS 메타데이터 · 삭제됐지만 열린 파일%s\n", C("2"), C("0"));
+        printf("  %spermission denied · FS metadata · deleted-but-open files%s\n", C("2"), C("0"));
         if (reserved) {
-            printf("  "); label("예약 공간", 20);
-            printf(" %7s          %sroot 전용 예약 블록, Used/Avail 에 미포함%s\n", r, C("2"), C("0"));
+            printf("  "); label("Reserved", 20);
+            printf(" %7s          %sroot-only reserved blocks, not in Used/Avail%s\n", r, C("2"), C("0"));
         }
     } else {
-        printf("  "); label("스캔 합계", 20);
+        printf("  "); label("Scanned total", 20);
         printf(" %7s\n", s);
     }
     if (vfs.f_files) {
         uint64_t iu = vfs.f_files - vfs.f_ffree;
-        printf("  "); label("inode 사용", 20);
+        printf("  "); label("Inodes used", 20);
         printf(" %6.1fM / %.1fM  (%.1f%%)\n", iu / 1e6, vfs.f_files / 1e6, 100.0 * iu / vfs.f_files);
     }
-    printf("  %s%.2fs · 폴더 %llu · 파일 %llu · 스레드 %d%s%s\n\n", C("2"), secs,
+    printf("  %s%.2fs · %llu dirs · %llu files · %d threads%s%s\n\n", C("2"), secs,
            (unsigned long long)st_dirs, (unsigned long long)st_files, opt_threads,
-           opt_apparent ? " · 논리 크기" : "", C("0"));
+           opt_apparent ? " · apparent size" : "", C("0"));
 }
 
 /* ---------- file types + largest files ---------- */
@@ -904,17 +1036,17 @@ static void print_types(tctx *ctx, int nt) {
         for (int j = i; j > 0 && bytes[order[j]] > bytes[order[j - 1]]; j--) {
             int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
         }
-    section("파일 종류별");
+    section("By file type");
     for (int i = 0; i < NCAT; i++) {
         int c = order[i];
         if (!count[c]) continue;
         char hs[16], cnt[32];
         human(bytes[c], hs, sizeof hs);
-        snprintf(cnt, sizeof cnt, "%llu개", (unsigned long long)count[c]);
+        snprintf(cnt, sizeof cnt, "%llu files", (unsigned long long)count[c]);
         printf("  "); label(cat_names[c], 26);
         printf(" %s%7s%s %5.1f%%  ", size_color(bytes[c]), hs, C("0"), 100.0 * bytes[c] / total);
         bar((double)bytes[c] / total, 20, "\033[35m");
-        printf(" %12s  %s%s%s\n", cnt, C("2"), cat_hint[c], C("0"));
+        printf(" %14s  %s%s%s\n", cnt, C("2"), cat_hint[c], C("0"));
     }
     putchar('\n');
 }
@@ -936,7 +1068,7 @@ static void print_bigfiles(tctx *ctx, int nt) {
     qsort(all, n, sizeof *all, cmp_big);
     if (n > opt_files) n = opt_files;
     char title[64];
-    snprintf(title, sizeof title, "가장 큰 파일 %d개", n);
+    snprintf(title, sizeof title, "Largest %d files", n);
     section(title);
     for (int i = 0; i < n; i++) {
         char hs[16];
@@ -981,26 +1113,27 @@ static uint64_t parse_size(const char *s) {
 
 static void usage(FILE *f) {
     fprintf(f,
-        "사용법: dirsize [옵션] [경로]   (기본 경로: /)\n"
+        "Usage: dirsize [options] [path]   (default path: /)\n"
         "\n"
-        "경로부터 디렉터리 용량을 병렬로 계산해 큰 순서의 트리로 보여줍니다.\n"
-        "기본은 시작 경로와 같은 파일시스템만 탐색합니다 (df -h 의 한 줄과 대응).\n"
+        "Scans the path in parallel and prints a size-sorted directory tree,\n"
+        "plus storage devices, NVMe health, usage by file type and the largest files.\n"
+        "Stays on the starting filesystem by default (matches one line of df -h).\n"
         "\n"
-        "  -d, --depth N      트리 표시 깊이 (기본 2)\n"
-        "  -n, --top N        폴더마다 큰 항목 N개만 표시, 0 = 전부 (기본 10)\n"
-        "  -m, --min SIZE     SIZE 미만 항목 숨김 (예: 100M, 1G)\n"
-        "  -j, --threads N    스레드 수 (기본: CPU 수 x 2, 최대 64)\n"
-        "  -c, --cross        다른 파일시스템(마운트)도 따라 들어감\n"
-        "  -f, --files N      가장 큰 파일 N개 표시, 0 = 끄기 (기본 15)\n"
-        "  -s, --simple       트리만 표시 (배너·저장장치·종류별·큰 파일 생략)\n"
-        "  -A, --apparent     할당 공간 대신 논리적 파일 크기\n"
-        "  -q, --quiet        진행 표시 끄기\n"
-        "      --no-color     색상 끄기\n"
-        "      --no-banner    배너 끄기\n"
-        "  -h, --help         도움말\n"
-        "  -V, --version      버전\n"
+        "  -d, --depth N      tree depth to display (default 2)\n"
+        "  -n, --top N        show the N largest entries per dir, 0 = all (default 10)\n"
+        "  -m, --min SIZE     hide entries smaller than SIZE (e.g. 100M, 1G)\n"
+        "  -j, --threads N    worker threads (default: 2 x CPUs, max 64)\n"
+        "  -c, --cross        cross into other filesystems (mount points)\n"
+        "  -f, --files N      show the N largest files, 0 = off (default 15)\n"
+        "  -s, --simple       usage + tree only (no banner/devices/types/largest files)\n"
+        "  -A, --apparent     apparent file sizes instead of allocated space\n"
+        "  -q, --quiet        no progress line\n"
+        "      --no-color     disable colors (NO_COLOR is honored too)\n"
+        "      --no-banner    hide the banner\n"
+        "  -h, --help         show this help\n"
+        "  -V, --version      show version\n"
         "\n"
-        "권한 없는 폴더는 건너뜁니다. 전체를 보려면: sudo dirsize\n");
+        "Unreadable dirs are skipped. For full totals and NVMe wear/TBW: sudo dirsize\n");
 }
 
 static volatile sig_atomic_t interrupted;
@@ -1040,7 +1173,7 @@ int main(int argc, char **argv) {
     if (!root) { perror(optind < argc ? argv[optind] : "/"); return 2; }
     struct stat rst;
     if (stat(root, &rst) < 0 || !S_ISDIR(rst.st_mode)) {
-        fprintf(stderr, "디렉터리가 아닙니다: %s\n", root);
+        fprintf(stderr, "not a directory: %s\n", root);
         return 2;
     }
     root_dev = rst.st_dev;
@@ -1076,7 +1209,7 @@ int main(int argc, char **argv) {
             if (done || interrupted) break;
             char hs[16];
             human(atomic_load(&st_bytes), hs, sizeof hs);
-            fprintf(stderr, "\r\033[K탐색 중… %s · 폴더 %llu · 파일 %llu · %.1fs",
+            fprintf(stderr, "\r\033[Kscanning… %s · %llu dirs · %llu files · %.1fs",
                     hs, (unsigned long long)st_dirs, (unsigned long long)st_files, elapsed());
             struct timespec ts = {0, 100 * 1000 * 1000};
             nanosleep(&ts, NULL);
@@ -1084,11 +1217,11 @@ int main(int argc, char **argv) {
         fputs("\r\033[K", stderr);
     }
     if (interrupted) {
-        fputs("\n중단했습니다.\n", stderr);
+        fputs("\ninterrupted\n", stderr);
         _exit(130);
     }
     for (int i = 0; i < opt_threads; i++) pthread_join(th[i], NULL);
-    if (interrupted) { fputs("\n중단했습니다.\n", stderr); return 130; }
+    if (interrupted) { fputs("\ninterrupted\n", stderr); return 130; }
     double secs = elapsed();
 
     compute_totals(top);
@@ -1102,7 +1235,7 @@ int main(int argc, char **argv) {
     print_breakdown(root, src, mnt, top->total, secs);
 
     char title[64];
-    snprintf(title, sizeof title, "폴더 트리 (깊이 %d · 폴더마다 상위 %d)", opt_depth, opt_top);
+    snprintf(title, sizeof title, "Directory tree (depth %d · top %d per dir)", opt_depth, opt_top);
     section(title);
     char prefix[4096] = "";
     print_row(top->total, top->total, "", "", root, 1, top->errors > 0, 0, NULL);
@@ -1116,14 +1249,14 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     if (st_errors) {
-        fprintf(stderr, "\n경고: 읽기 오류 %llu건 (합계가 실제보다 작을 수 있음)%s\n",
-                (unsigned long long)st_errors, geteuid() ? " — 전체를 보려면 sudo 로 실행" : "");
+        fprintf(stderr, "\nwarning: %llu read errors (totals may be low)%s\n",
+                (unsigned long long)st_errors, geteuid() ? " — run with sudo for full totals" : "");
         int n = err_n < ERR_SAMPLES ? err_n : ERR_SAMPLES;
         for (int i = 0; i < n; i++) if (err_samples[i]) fprintf(stderr, "  %s\n", err_samples[i]);
-        if (err_n > ERR_SAMPLES) fprintf(stderr, "  … 외 %d건\n", err_n - ERR_SAMPLES);
+        if (err_n > ERR_SAMPLES) fprintf(stderr, "  … %d more\n", err_n - ERR_SAMPLES);
     }
     if (st_mounts && !opt_cross)
-        fprintf(stderr, "다른 파일시스템 %llu곳은 건너뜀 (포함하려면 -c)\n",
+        fprintf(stderr, "skipped %llu other filesystems (include with -c)\n",
                 (unsigned long long)st_mounts);
     return st_errors ? 1 : 0;
 }
