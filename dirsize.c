@@ -29,7 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "2.2.0"
+#define VERSION "2.3.0"
 #define DENTS_BUF (64 * 1024)
 
 /* ---------- options ---------- */
@@ -86,6 +86,7 @@ static work *wq;
 static size_t wq_len, wq_cap;
 static int wq_active;
 static int wq_done;
+static _Atomic int wq_idle;   // threads blocked in wq_pop: a hint to share local work
 static pthread_mutex_t wq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wq_cv = PTHREAD_COND_INITIALIZER;
 
@@ -111,7 +112,9 @@ static int wq_pop(work *out) {
             pthread_cond_broadcast(&wq_cv);
             break;
         }
+        atomic_fetch_add_explicit(&wq_idle, 1, memory_order_relaxed);
         pthread_cond_wait(&wq_cv, &wq_mu);
+        atomic_fetch_sub_explicit(&wq_idle, 1, memory_order_relaxed);
     }
     if (wq_done && wq_len == 0) {
         pthread_mutex_unlock(&wq_mu);
@@ -186,7 +189,8 @@ static int hl_insert(uint64_t dev, uint64_t ino) {
 
 /* ---------- stats ---------- */
 
-static _Atomic uint64_t st_dirs, st_files, st_errors, st_bytes, st_mounts;
+static _Atomic uint64_t st_errors, st_mounts;
+static uint64_t st_dirs, st_files;   // summed from threads after the scan
 static dev_t root_dev;
 
 #define ERR_SAMPLES 10
@@ -319,10 +323,18 @@ static int classify(const char *name) {
 
 typedef struct { uint64_t size; char *path; } bigfile;
 
+typedef struct { uint64_t ino; uint32_t off; uint8_t type; } dent;
+
 typedef struct {
     char *buf;
-    work *batch;
-    size_t bcap;
+    work *batch;      // local LIFO stack of directories still to scan
+    size_t bcap, blen;
+    char *names;      // names of the directory being scanned
+    size_t ncap;
+    dent *ents;
+    size_t ecap;
+    // owned by this thread; written with relaxed atomics so the progress line can read them
+    _Atomic uint64_t n_dirs, n_files, n_bytes;
     uint64_t cat_bytes[NCAT], cat_count[NCAT];
     bigfile *heap;
     int heap_n;
@@ -363,10 +375,24 @@ struct linux_dirent64 {
     char d_name[];
 };
 
+static int cmp_dent(const void *a, const void *b) {
+    uint64_t x = ((const dent *)a)->ino, y = ((const dent *)b)->ino;
+    return x < y ? -1 : x > y;
+}
+
+static inline void bump(_Atomic uint64_t *c, uint64_t v) {   // single writer, no lock prefix
+    atomic_store_explicit(c, atomic_load_explicit(c, memory_order_relaxed) + v, memory_order_relaxed);
+}
+
+static void push_local(tctx *t, work w) {
+    if (t->blen == t->bcap) {
+        t->bcap *= 2;
+        t->batch = realloc(t->batch, t->bcap * sizeof *t->batch);
+    }
+    t->batch[t->blen++] = w;
+}
+
 static void scan_dir(work *w, tctx *t) {
-    char *buf = t->buf;
-    work **batch = &t->batch;
-    size_t *bcap = &t->bcap;
     int fd = open(w->path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_NOATIME);
     if (fd < 0 && errno == EPERM)
         fd = open(w->path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -374,76 +400,97 @@ static void scan_dir(work *w, tctx *t) {
         record_error(w->target, w->path, errno);
         return;
     }
-    atomic_fetch_add(&st_dirs, 1);
+    bump(&t->n_dirs, 1);
 
-    uint64_t local = 0, files = 0;
-    size_t nb = 0;
-    int tracked_kids = w->depth < opt_depth && w->target->depth == w->depth;
-
+    // 1) read all entries first
+    size_t ne = 0, nlen = 0;
     for (;;) {
-        long n = syscall(SYS_getdents64, fd, buf, DENTS_BUF);
+        long n = syscall(SYS_getdents64, fd, t->buf, DENTS_BUF);
         if (n < 0) { record_error(w->target, w->path, errno); break; }
         if (n == 0) break;
         for (long off = 0; off < n;) {
-            struct linux_dirent64 *d = (struct linux_dirent64 *)(buf + off);
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(t->buf + off);
             off += d->d_reclen;
             const char *nm = d->d_name;
             if (nm[0] == '.' && (!nm[1] || (nm[1] == '.' && !nm[2]))) continue;
-
-            struct stat st;
-            if (fstatat(fd, nm, &st, AT_SYMLINK_NOFOLLOW) < 0) {
-                char *p = join(w->path, nm);
-                record_error(w->target, p, errno);
-                free(p);
-                continue;
+            size_t l = strlen(nm) + 1;
+            if (nlen + l > t->ncap) {
+                while (nlen + l > t->ncap) t->ncap *= 2;
+                t->names = realloc(t->names, t->ncap);
             }
+            if (ne == t->ecap) {
+                t->ecap *= 2;
+                t->ents = realloc(t->ents, t->ecap * sizeof *t->ents);
+            }
+            memcpy(t->names + nlen, nm, l);
+            t->ents[ne++] = (dent){d->d_ino, (uint32_t)nlen, d->d_type};
+            nlen += l;
+        }
+    }
 
-            if (S_ISDIR(st.st_mode)) {
-                if (!opt_cross && st.st_dev != root_dev) {
-                    atomic_fetch_add(&st_mounts, 1);
-                    if (tracked_kids) {
-                        node *k = node_new(nm, w->target, w->depth + 1);
-                        k->is_mount = 1;
-                        node_add_kid(w->target, k);
-                    }
-                    continue;
-                }
-                node *tgt = w->target;
+    // 2) stat in inode order: on a cold cache this turns random inode-table reads
+    //    into mostly sequential ones (big win on ext4/xfs, harmless when cached)
+    if (ne > 1) qsort(t->ents, ne, sizeof *t->ents, cmp_dent);
+
+    uint64_t local = 0, files = 0, nfiles = 0;
+    int tracked_kids = w->depth < opt_depth && w->target->depth == w->depth;
+    for (size_t i = 0; i < ne; i++) {
+        const char *nm = t->names + t->ents[i].off;
+        struct statx sx;
+        if (statx(fd, nm, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_STATX_DONT_SYNC,
+                  STATX_TYPE | STATX_NLINK | STATX_INO | STATX_SIZE | STATX_BLOCKS, &sx) < 0) {
+            char *p = join(w->path, nm);
+            record_error(w->target, p, errno);
+            free(p);
+            continue;
+        }
+        uint64_t sz = opt_apparent ? ((S_ISREG(sx.stx_mode) || S_ISLNK(sx.stx_mode)) ? sx.stx_size : 0)
+                                   : sx.stx_blocks * 512;
+
+        if (S_ISDIR(sx.stx_mode)) {
+            if (!opt_cross && makedev(sx.stx_dev_major, sx.stx_dev_minor) != root_dev) {
+                atomic_fetch_add(&st_mounts, 1);
                 if (tracked_kids) {
-                    tgt = node_new(nm, w->target, w->depth + 1);
-                    node_add_kid(w->target, tgt);
+                    node *k = node_new(nm, w->target, w->depth + 1);
+                    k->is_mount = 1;
+                    node_add_kid(w->target, k);
                 }
-                atomic_fetch_add(&tgt->self, size_of(&st));
-                if (nb == *bcap) {
-                    *bcap *= 2;
-                    *batch = realloc(*batch, *bcap * sizeof **batch);
-                }
-                (*batch)[nb++] = (work){join(w->path, nm), tgt, w->depth + 1};
                 continue;
             }
-
-            if (st.st_nlink > 1 && !hl_insert(st.st_dev, st.st_ino)) continue;
-            uint64_t sz = size_of(&st);
-            local += sz;
-            files += sz;
-            atomic_fetch_add(&st_files, 1);
-            if (S_ISREG(st.st_mode)) {
-                int c = classify(nm);
-                t->cat_bytes[c] += sz;
-                t->cat_count[c]++;
-                if (opt_files && (t->heap_n < opt_files || sz > t->heap[0].size))
-                    heap_push(t, sz, w->path, nm);
+            node *tgt = w->target;
+            if (tracked_kids) {
+                tgt = node_new(nm, w->target, w->depth + 1);
+                node_add_kid(w->target, tgt);
             }
+            if (tgt == w->target) local += sz;
+            else atomic_fetch_add(&tgt->self, sz);
+            push_local(t, (work){join(w->path, nm), tgt, w->depth + 1});
+            continue;
+        }
+
+        if (sx.stx_nlink > 1 &&
+            !hl_insert(makedev(sx.stx_dev_major, sx.stx_dev_minor), sx.stx_ino))
+            continue;
+        local += sz;
+        files += sz;
+        nfiles++;
+        if (S_ISREG(sx.stx_mode)) {
+            int c = classify(nm);
+            t->cat_bytes[c] += sz;
+            t->cat_count[c]++;
+            if (opt_files && (t->heap_n < opt_files || sz > t->heap[0].size))
+                heap_push(t, sz, w->path, nm);
         }
     }
     close(fd);
 
     if (local) {
         atomic_fetch_add(&w->target->self, local);
-        atomic_fetch_add(&st_bytes, local);
+        bump(&t->n_bytes, local);
     }
+    bump(&t->n_files, nfiles);
+    // direct-file bytes for the "(files in this dir)" row; only one thread scans this dir
     if (files && w->target->depth == w->depth) w->target->files_direct += files;
-    wq_push_many(*batch, nb);
 }
 
 static void *worker(void *arg) {
@@ -451,15 +498,33 @@ static void *worker(void *arg) {
     t->buf = malloc(DENTS_BUF);
     t->bcap = 256;
     t->batch = malloc(t->bcap * sizeof *t->batch);
+    t->ncap = 1 << 16;
+    t->names = malloc(t->ncap);
+    t->ecap = 1024;
+    t->ents = malloc(t->ecap * sizeof *t->ents);
     t->heap = calloc(opt_files ? opt_files : 1, sizeof *t->heap);
     work w;
+    // Depth-first on a private stack; hand half of it to the shared queue
+    // only when some thread is idle, so the shared lock is rarely touched.
     while (wq_pop(&w)) {
-        scan_dir(&w, t);
-        free(w.path);
+        for (;;) {
+            scan_dir(&w, t);
+            free(w.path);
+            if (t->blen > 1 && atomic_load_explicit(&wq_idle, memory_order_relaxed) > 0) {
+                size_t give = t->blen / 2;
+                wq_push_many(t->batch, give);   // oldest (shallowest = biggest) entries
+                memmove(t->batch, t->batch + give, (t->blen - give) * sizeof *t->batch);
+                t->blen -= give;
+            }
+            if (!t->blen) break;
+            w = t->batch[--t->blen];
+        }
         wq_finish_one();
     }
     free(t->batch);
     free(t->buf);
+    free(t->names);
+    free(t->ents);
     return NULL;
 }
 
@@ -1122,7 +1187,7 @@ static void usage(FILE *f) {
         "  -d, --depth N      tree depth to display (default 2)\n"
         "  -n, --top N        show the N largest entries per dir, 0 = all (default 10)\n"
         "  -m, --min SIZE     hide entries smaller than SIZE (e.g. 100M, 1G)\n"
-        "  -j, --threads N    worker threads (default: 2 x CPUs, max 64)\n"
+        "  -j, --threads N    worker threads (default: CPU count; try 128+ on a cold cache/HDD/NFS)\n"
         "  -c, --cross        cross into other filesystems (mount points)\n"
         "  -f, --files N      show the N largest files, 0 = off (default 15)\n"
         "  -s, --simple       usage + tree only (no banner/devices/types/largest files)\n"
@@ -1182,9 +1247,10 @@ int main(int argc, char **argv) {
 
     if (opt_threads <= 0) {
         long nc = sysconf(_SC_NPROCESSORS_ONLN);
-        opt_threads = nc > 0 ? (int)nc * 2 : 8;
+        // one per CPU is fastest when metadata is cached; more only helps cold disks
+        opt_threads = nc > 0 ? (int)nc : 8;
     }
-    if (opt_threads > 64) opt_threads = 64;
+    if (opt_threads > 512) opt_threads = 512;
     for (int i = 0; i < SHARDS; i++) pthread_mutex_init(&hl[i].mu, NULL);
     if (simple) opt_files = 0;
     ext_init();
@@ -1207,10 +1273,16 @@ int main(int argc, char **argv) {
             int done = wq_done;
             pthread_mutex_unlock(&wq_mu);
             if (done || interrupted) break;
+            uint64_t b = 0, nd = 0, nf = 0;
+            for (int i = 0; i < opt_threads; i++) {
+                b += atomic_load_explicit(&ctx[i].n_bytes, memory_order_relaxed);
+                nd += atomic_load_explicit(&ctx[i].n_dirs, memory_order_relaxed);
+                nf += atomic_load_explicit(&ctx[i].n_files, memory_order_relaxed);
+            }
             char hs[16];
-            human(atomic_load(&st_bytes), hs, sizeof hs);
+            human(b, hs, sizeof hs);
             fprintf(stderr, "\r\033[Kscanning… %s · %llu dirs · %llu files · %.1fs",
-                    hs, (unsigned long long)st_dirs, (unsigned long long)st_files, elapsed());
+                    hs, (unsigned long long)nd, (unsigned long long)nf, elapsed());
             struct timespec ts = {0, 100 * 1000 * 1000};
             nanosleep(&ts, NULL);
         }
@@ -1223,6 +1295,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < opt_threads; i++) pthread_join(th[i], NULL);
     if (interrupted) { fputs("\ninterrupted\n", stderr); return 130; }
     double secs = elapsed();
+    for (int i = 0; i < opt_threads; i++) { st_dirs += ctx[i].n_dirs; st_files += ctx[i].n_files; }
 
     compute_totals(top);
 

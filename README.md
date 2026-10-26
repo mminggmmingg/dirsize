@@ -81,7 +81,14 @@ warning: 95 read errors (totals may be low) — run with sudo for full totals
 skipped 37 other filesystems (include with -c)
 ```
 
-Scanning `/` (2.5M files, 300K dirs) takes ~0.3 s with a warm cache on a 32-core machine.
+Scanning `/` (2.5M files, 300K dirs) takes ~0.3 s with a warm cache on a 16-core / 32-thread machine.
+
+How it is fast:
+- one worker thread per CPU, each walking depth-first on its own stack; work is handed to the
+  shared queue only when another thread is idle, so the shared lock is rarely touched
+- raw `getdents64` with a 64 KiB buffer, then `statx` with a minimal field mask relative to the directory fd
+- entries are stat'ed in inode order, which turns cold-cache inode-table reads into mostly sequential I/O
+- per-thread counters, category totals and largest-file heaps, merged once at the end
 
 ## Build / install
 
@@ -108,7 +115,7 @@ dirsize -c /            # cross into other filesystems (mount points)
 | `-m, --min SIZE` | hide entries smaller than SIZE (`100M`, `1G`, …) |
 | `-f, --files N` | show the N largest files, 0 = off (default 15) |
 | `-s, --simple` | usage + tree only (no banner, devices, file types, largest files) |
-| `-j, --threads N` | worker threads (default 2 × CPUs, max 64) |
+| `-j, --threads N` | worker threads (default: CPU count). On a cold cache, HDD or NFS, more threads (e.g. `-j 128`) keep more I/O in flight |
 | `-c, --cross` | cross into other filesystems |
 | `-A, --apparent` | apparent file sizes instead of allocated space |
 | `-q, --quiet` | no progress line |
