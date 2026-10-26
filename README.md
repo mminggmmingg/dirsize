@@ -90,7 +90,23 @@ How it is fast:
 - entries are stat'ed in inode order, which turns cold-cache inode-table reads into mostly sequential I/O
 - per-thread counters, category totals and largest-file heaps, merged once at the end
 
-## Build / install
+## Quick install (one shot)
+
+Copy-paste on any Ubuntu/Debian machine — installs build tools, builds, installs to `/usr/local/bin/dirsize`, cleans up, and runs it:
+
+```bash
+sudo apt-get install -y git build-essential && d=$(mktemp -d) && git clone --depth 1 https://github.com/mminggmmingg/dirsize.git "$d" && make -C "$d" && sudo make -C "$d" install && rm -rf "$d" && sudo dirsize
+```
+
+> The repository is private: `git clone` needs GitHub access (`gh auth login` once, or use an SSH URL).
+
+Update to the latest version: run the same line again. Uninstall:
+
+```bash
+sudo rm -f /usr/local/bin/dirsize
+```
+
+## Build from a checkout
 
 ```sh
 make
