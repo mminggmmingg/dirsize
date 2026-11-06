@@ -158,3 +158,7 @@ dirsize -c /            # cross into other filesystems (mount points)
 - Do not add up parent and child rows: a directory's size already includes its children.
 - The banner is shown only on a terminal at least 96 columns wide.
 - Exit code: 0 complete, 1 read errors (partial totals), 2 bad arguments, 130 interrupted.
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE). Copyright (C) 2026 mminggmmingg. Modified versions you distribute must also be released as source under GPL-3.0.
